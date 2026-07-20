@@ -95,6 +95,7 @@ class PPO:
 
         # Add storage
         self.storage = storage
+        # 这里初始化是根据RolloutStorage初始化，但是空间只有一个，也就是这是个暂时存储和环境交互一步获得的信息
         self.transition = RolloutStorage.Transition()
 
         # PPO parameters
@@ -111,10 +112,11 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
-
+    # 传过来环境得到的当前的状态s_t
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
         # Record the hidden states for recurrent policies
+        # 根据当前的状态s_t，通过策略网络得到动作a_t和价值函数V(s_t)，并记录当前步骤的h_t，a_t，V(s_t)，log_prob，分布参数，观测s_t
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
         # Compute the actions and values
         self.transition.actions = self.actor(obs, stochastic_output=True).detach()
@@ -124,12 +126,13 @@ class PPO:
         # Record observations before env.step()
         self.transition.observations = obs
         return self.transition.actions  # type: ignore
-
+    # 传过来环境得到的观测
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
         """Record one environment step and update the normalizers."""
         # Update the normalizers
+        # 将从环境得到的s_t+1归一化
         self.actor.update_normalization(obs)
         self.critic.update_normalization(obs)
         if self.rnd:
@@ -137,6 +140,7 @@ class PPO:
 
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
+        # 将得到的奖励和done存入transition
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
 
@@ -155,56 +159,80 @@ class PPO:
             )
 
         # Record the transition
+        # 至此，transition中已经有了s_t，a_t，V(s_t)，log_prob(a_t|s_t)，分布参数，s_t+1，r_t，done，直接添加进入storage中
         self.storage.add_transition(self.transition)
         self.transition.clear()
         self.actor.reset(dones)
         self.critic.reset(dones)
-
+    # 计算回报函数，公式就是G_t=A^{GAE}_t+V(s_t)，这里会传入最后一个s_t+1的观测，比如每一个step都会收集s_t和s_t+1
+    # 下一个step收集的s_t其实就是上一个step的s_t+1，假设一个epoch收集24步，那么storage其实收集了24个V(s_t)和25个s_t
+    # 所以这里传入第25个s_t是要去计算第25个V(s_t)
     def compute_returns(self, obs: TensorDict) -> None:
         """Compute return and advantage targets from stored transitions."""
         st = self.storage
         # Compute values for the last step
         critic_hidden_state = self.critic.get_hidden_state()
+        # 去获得最后一个V(s_t)
         last_values = self.critic(obs).detach()
         # Restore the critic's hidden state so the next rollout is not affected by the forward pass
         self.critic.reset(hidden_state=critic_hidden_state)
         # Compute returns and advantages
+        # 初始化优势函数为0
         advantage = 0
+        # 从后向前遍历，这里是去计算优势函数，，其公式是A^GAE_t=delta_t+gamma*lambda*A^GAE_{t+1}其中delta_t=r_t+gamma*V(s_{t+1})-V(s_t)
         for step in reversed(range(st.num_transitions_per_env)):
             # If we are at the last step, bootstrap the return value
+            # 我们有25个V(s_t)，但是我们这里取的是最后24个V(s_t)
             next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
             # 1 if we are not in a terminal state, 0 otherwise
+            # 这里根据done来判断是否是终止状态，如果是终止状态，那么下一步的V(s_{t+1})就不应该参与delta_t的计算
             next_is_not_terminal = 1.0 - st.dones[step].float()
             # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
+            # 这个就是TD误差，st.values[step]就是前24步的V(s_t)，所以根据公式的定义，delta_t就是r_t+gamma*V(s_{t+1})-V(s_t)
             delta = st.rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
             # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
+            # 然后根据公式去计算每一步的优势函数A^GAE_t=delta_t+gamma*lambda*A^GAE_{t+1}
             advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
             # Return: R_t = A(s_t, a_t) + V(s_t)
+            # 然后在根据公式去计算回报函数G_t=A^{GAE}_t+V(s_t)
             st.returns[step] = advantage + st.values[step]
         # Compute the advantages
+        # 把24步的优势函数值存入st.advantages中
         st.advantages = st.returns - st.values
         # Normalize the advantages if per minibatch normalization is not used
+        # 如果开了则将优势函数归一化
         if not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
+        # critic损失
         mean_value_loss = 0
+        # actor损失
         mean_surrogate_loss = 0
+        # 策略分布熵
         mean_entropy = 0
         # RND loss
+        # RND predictor损失
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
+        # 机器人动作对称性损失
         mean_symmetry_loss = 0 if self.symmetry else None
 
         # Get mini-batch generator
+        # 生成mini-batch，由于是普通的MLP，则是有mini_batch_generator方法，如果是RNN则是recurrent_mini_batch_generator方法
+        # num_steps_per_env=24，num_envs=4096的话那么一次epoch总共有98304个数据，num_mini_batches
+        # 则每个batch有24576个数据，也就是[4, 24576]，一个数据就包含了s_t，a_t，V(s_t)，log_prob(a_t|s_t)，分布参数，s_t+1，r_t，done
+        # 每个batch可以这么调用batch.observations，batch.actions，batch.values，batch.old_actions_log_prob，batch.old_distribution_params，batch.returns，batch.advantages
         if self.actor.is_recurrent or self.critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # Iterate over mini-batches
+        # 对于每一个batch
         for batch in generator:
+            # 记录原始batch大小
             original_batch_size = batch.observations.batch_size[0]
 
             # Check if we should normalize advantages per mini-batch
@@ -213,17 +241,20 @@ class PPO:
                     batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)  # type: ignore
 
             # Perform symmetric augmentation if enabled
+            # 可选是否对称数据增强
             if self.symmetry:
                 self.symmetry.augment_batch(batch, original_batch_size)
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with new parameters
+            # 传入这个batch的观测，得到新的动作分布参数，然后计算出新的log_prob和熵
             self.actor(
                 batch.observations,
                 masks=batch.masks,
                 hidden_state=batch.hidden_states[0],
                 stochastic_output=True,
             )
+            # 计算当前策略下的log_prob(a_t|s_t)和熵
             actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
             values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
             # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
@@ -231,6 +262,7 @@ class PPO:
             entropy = self.actor.output_entropy[:original_batch_size]
 
             # Compute KL divergence and adapt the learning rate
+            # 计算KL并调整学习率
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
                     kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
@@ -259,22 +291,27 @@ class PPO:
                         param_group["lr"] = self.learning_rate
 
             # Surrogate loss
+            # 在20次更新中，batch.old_actions.log_prob是固定的，而actions_log_prob是随着策略网络更新而变化的，所以这里计算的是当前策略和旧策略之间的比值
             ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
+            # 这就是PPO的追求的目标
             surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
+            # PPO截断
             surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
             # Value function loss
+            # 计算critic的损失，如果使用了截断的方式
             if self.use_clipped_value_loss:
                 value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
                 value_losses = (values - batch.returns).pow(2)
                 value_losses_clipped = (value_clipped - batch.returns).pow(2)
+                # 分别计算正常误差和截断误差，去较大的误差然后取平均
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
-
+            # PPO的总损失函数，包含了策略损失，价值函数损失和熵正则化项
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
             # RND loss
@@ -288,6 +325,7 @@ class PPO:
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
+            # 因为optimizer同时管理actor和critic的参数，所以这里直接对总损失函数求梯度
             loss.backward()
             # Compute the gradients for RND
             if self.rnd:
@@ -299,6 +337,7 @@ class PPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
+            # 梯度裁剪
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()

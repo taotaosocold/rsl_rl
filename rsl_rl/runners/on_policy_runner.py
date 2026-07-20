@@ -30,13 +30,16 @@ class OnPolicyRunner:
         self.device = device
 
         # Setup multi-GPU training if enabled
+        # 配置多gpu训练
         self._configure_multi_gpu()
 
         # Query observations from the environment for algorithm construction
         obs = self.env.get_observations()
 
         # Create the algorithm
+        # 根据算法名称获得算法类
         alg_class: type[PPO] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
+        # 根据算法类构建算法实例
         self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
 
         # Create the logger
@@ -82,8 +85,10 @@ class OnPolicyRunner:
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):
                     # Sample actions
+                    # 根据当前的状态s_t来经过policy策略获得动作a_t
                     actions = self.alg.act(obs)
                     # Step the environment
+                    # 根据a_t子啊环境中执行一步，获得s_t+1，r_t，done，info
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Check for NaN values from the environment
                     if self.cfg.get("check_for_nan", True):
@@ -91,6 +96,8 @@ class OnPolicyRunner:
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # Process the step
+                    # 传过去s_t+1，r_t，done，info，将这一步获得的所有信息存储到transition中
+                    # 包括s_t，a_t，V(s_t)，log_prob(a_t|s_t)，分布参数，s_t+1，r_t，done
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards if RND is used (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.cfg["algorithm"]["rnd_cfg"] else None
