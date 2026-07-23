@@ -259,6 +259,7 @@ class PPO:
             values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
             # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
             distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
+            # 计算当前策略网络的分布去计算熵，是根据当前的batch计算的熵
             entropy = self.actor.output_entropy[:original_batch_size]
 
             # Compute KL divergence and adapt the learning rate
@@ -299,6 +300,7 @@ class PPO:
             surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
+            # 这里取的是较大的损失，然后取平均，这就是PPO的目标函数
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
             # Value function loss
