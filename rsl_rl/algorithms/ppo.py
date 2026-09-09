@@ -256,6 +256,7 @@ class PPO:
             )
             # 计算当前策略下的log_prob(a_t|s_t)和熵
             actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
+            # 获得价值网络认为当前状态的价值函数，也就是拟合的回报函数
             values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
             # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
             distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
@@ -307,6 +308,7 @@ class PPO:
             # 计算critic的损失，如果使用了截断的方式
             if self.use_clipped_value_loss:
                 value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
+                # 价值网络的损失就是实际的回报函数和拟合的回报函数之间的均方误差（这个实际的回报函数其实本质也是贝尔曼公式的TD误差）
                 value_losses = (values - batch.returns).pow(2)
                 value_losses_clipped = (value_clipped - batch.returns).pow(2)
                 # 分别计算正常误差和截断误差，去较大的误差然后取平均
